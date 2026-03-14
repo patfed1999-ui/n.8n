@@ -162,14 +162,16 @@ else if (utcHour >= 12 && utcHour <= 20) { sessionForce = 'SHORT'; sessionFilter
 else if (utcHour >= 21 && utcHour <= 22) { sessionForce = 'LONG';  sessionFilterReason = `Transizione NY→Asia ${utcHour}:xx UTC (WR LONG 100%)`;   }
 else                                     { sessionForce = 'SHORT'; sessionFilterReason = `Sessione Asia ${utcHour}:xx UTC (WR SHORT 100%)`;          }
 
-// ─── PRICE LEVEL BIAS ───────────────────────────────────────
-// Derivato da 113 trade reali: <3050 LONG WR 72%, >3050 SHORT WR 93%
-// NOTA: soglia dinamica basata sul prezzo corrente ±2%
-const PRICE_THRESHOLD = 3050; // Aggiornare manualmente se gold si sposta >200$ stabile
+// ─── PRICE LEVEL BIAS (dinamico v4.0) ───────────────────────
+// Usa MA20 del gold se disponibile dalla fusion, altrimenti fallback
+// a goldPrice stesso (neutro — evita bias fisso obsoleto)
+const PRICE_THRESHOLD = fusion.goldPriceMa20 && fusion.goldPriceMa20 > 1500
+  ? fusion.goldPriceMa20
+  : goldPrice; // fallback neutro: soglia = prezzo corrente
 let priceBias = goldPrice < PRICE_THRESHOLD ? 'LONG' : 'SHORT';
 let priceBiasReason = goldPrice < PRICE_THRESHOLD
-  ? `Gold $${goldPrice.toFixed(0)} < $${PRICE_THRESHOLD} → bias LONG (WR 72%)`
-  : `Gold $${goldPrice.toFixed(0)} > $${PRICE_THRESHOLD} → bias SHORT (WR 93%)`;
+  ? `Gold $${goldPrice.toFixed(0)} < MA20 $${PRICE_THRESHOLD.toFixed(0)} → bias LONG`
+  : `Gold $${goldPrice.toFixed(0)} > MA20 $${PRICE_THRESHOLD.toFixed(0)} → bias SHORT`;
 
 // ─── FIX G10: RSI + MA BIDIREZIONALE ────────────────────────
 // Bonus/malus tecnico per LONG e SHORT
@@ -253,20 +255,23 @@ const qualityScore = Math.round(
 let setupGrade = 'C';
 if      (qualityScore >= 80) setupGrade = 'A+';
 else if (qualityScore >= 70) setupGrade = 'A';
-else if (qualityScore >= 58) setupGrade = 'B';
+else if (qualityScore >= 62) setupGrade = 'B';  // B ora operativo (era 58, soglia filtro abbassata a 62)
 
 let riskProfile = 'CONSERVATIVO';
 if      (qualityScore >= 75 && vix < 20) riskProfile = 'AGGRESSIVO';
 else if (qualityScore >= 60 && vix < 25) riskProfile = 'MODERATO';
 
-// ─── DRAWDOWN PROTECTION ────────────────────────────────────
-const recentLosses    = recentTrades.slice(-3).filter(t => t.outcome === 'LOSS').length;
+// ─── DRAWDOWN PROTECTION (v4.0 — morbida) ───────────────────
+// Prima: 3 loss → stop forzato. Ora: graduale fino a 5 loss
+const recentLosses    = recentTrades.slice(-5).filter(t => t.outcome === 'LOSS').length;
 let drawdownProtection = false;
 let drawdownNote       = '';
 let sizeMultiplierDD   = 1.0;
 
-if      (recentLosses >= 3) { drawdownProtection = true; sizeMultiplierDD = 0.25; drawdownNote = '🔴 3 LOSS → Size 25%'; }
-else if (recentLosses >= 2) { drawdownProtection = true; sizeMultiplierDD = 0.5;  drawdownNote = '🟡 2 LOSS → Size 50%'; }
+if      (recentLosses >= 5) { drawdownProtection = true; sizeMultiplierDD = 0.15; drawdownNote = '🔴 5 LOSS → Size 15% (veto soft)'; }
+else if (recentLosses >= 4) { drawdownProtection = true; sizeMultiplierDD = 0.20; drawdownNote = '🟠 4 LOSS → Size 20%'; }
+else if (recentLosses >= 3) { drawdownProtection = true; sizeMultiplierDD = 0.40; drawdownNote = '🟡 3 LOSS → Size 40%'; }
+else if (recentLosses >= 2) { drawdownProtection = true; sizeMultiplierDD = 0.70; drawdownNote = '🟡 2 LOSS → Size 70%'; }
 
 // ─── VETO ───────────────────────────────────────────────────
 let vetoActive = false;
@@ -275,7 +280,7 @@ if (D1A.eventVetoActive)                    { vetoActive = true; vetoReason = 'E
 if (D5.vetoUpcoming)                        { vetoActive = true; vetoReason = `D4_BC: ${D4_BC.upcomingCritical?.[0] || 'Evento critico <45min'}`; }
 if (rawAtr >= 8 && rawAtr > atr * 2.5)     { vetoActive = true; vetoReason = 'Volatilità estrema ATR > 2.5x'; }
 if (D11.score <= -3)                        { vetoActive = true; vetoReason = 'Mercato chiuso (Weekend)'; }
-if (drawdownProtection && recentLosses >= 3){ vetoActive = true; vetoReason = '3 LOSS consecutivi — stop forzato'; }
+if (drawdownProtection && recentLosses >= 5){ vetoActive = true; vetoReason = '5 LOSS consecutivi — stop soft 2h'; } // era 3, ora 5
 
 // ─── DIREZIONE BASE (prima del session filter) ────────────────
 let direction = 'WAIT', directionEmoji = '🟡';
@@ -290,25 +295,46 @@ if (!vetoActive) {
   }
 }
 
-// ─── APPLICA SESSION FILTER ──────────────────────────────────
-// Il filtro BLOCCA la direzione sbagliata, non forza un trade
+// ─── APPLICA SESSION FILTER (SOFT BIAS v4.0) ─────────────────
+// Il filtro NON blocca più la direzione — applica size penalty -30%
+// se direzione è contro-sessione. Trade eseguito ma con rischio ridotto.
+let sessionSizePenalty = 1.0;
 if (!vetoActive && sessionForce) {
   if (direction === 'LONG' && sessionForce === 'SHORT') {
-    // Score dice LONG ma sessione dice SHORT → WAIT con bias SHORT
-    direction = 'WAIT_BIAS_SHORT';
-    directionEmoji = '⏳↓';
+    // Contro-sessione: esegue LONG ma riduce size del 30%
+    sessionSizePenalty = 0.70;
     sessionFilterApplied = true;
+    directionEmoji = '🟢⚠️';
   } else if (direction === 'SHORT' && sessionForce === 'LONG') {
-    // Score dice SHORT ma sessione dice LONG → WAIT con bias LONG
-    direction = 'WAIT_BIAS_LONG';
-    directionEmoji = '⏳↑';
+    // Contro-sessione: esegue SHORT ma riduce size del 30%
+    sessionSizePenalty = 0.70;
     sessionFilterApplied = true;
+    directionEmoji = '🔴⚠️';
   } else if (direction.includes('WAIT')) {
-    // In area WAIT → usa sessione come tie-breaker
-    direction      = sessionForce === 'LONG' ? 'WAIT_BIAS_LONG' : 'WAIT_BIAS_SHORT';
-    directionEmoji = sessionForce === 'LONG' ? '🟡↑' : '🟡↓';
+    // In area WAIT → usa sessione come tie-breaker (promuove a direzione)
+    direction      = sessionForce === 'LONG' ? 'LONG' : 'SHORT';
+    directionEmoji = sessionForce === 'LONG' ? '🟢' : '🔴';
+    sessionSizePenalty = 0.80; // size ridotta per segnale debole promosso
   }
-  // Se direction già allineata con sessionForce → conferma, nessuna modifica
+  // Se direction già allineata con sessionForce → conferma piena, nessuna modifica
+}
+
+// ─── THROTTLE SEGNALI (deduplicazione 30min) ─────────────────
+// Previene segnali duplicati se lo stesso trade viene segnalato
+// più volte nello stesso ciclo di 30 minuti
+const lastSignalTs  = fusion.lastSignalTs  || 0;
+const lastSignalDir = fusion.lastSignalDir || '';
+const THROTTLE_MS   = 30 * 60 * 1000; // 30 minuti
+let throttled = false;
+if (
+  !vetoActive &&
+  (direction === 'LONG' || direction === 'SHORT') &&
+  direction === lastSignalDir &&
+  (Date.now() - lastSignalTs) < THROTTLE_MS
+) {
+  throttled = true;
+  direction = 'THROTTLED';
+  directionEmoji = '⏸️';
 }
 
 const isLong = direction.includes('LONG') || (direction === 'WAIT' && rawConf >= 0);
@@ -364,8 +390,9 @@ else if (fng > 75)             { sizeMultiplier = 0.8; sizeNote = `🤑 F&G ${fn
 else if (confidenceScore < 50) { sizeMultiplier = 0.5; sizeNote = `⚠️ Conf ${confidenceScore.toFixed(0)}% → Size 50%`; }
 else                           { sizeMultiplier = 1.0; sizeNote = '✅ Condizioni ok → Size 100%'; }
 
-sizeMultiplier = +(sizeMultiplier * sizeMultiplierDD).toFixed(2);
+sizeMultiplier = +(sizeMultiplier * sizeMultiplierDD * sessionSizePenalty).toFixed(2);
 if (drawdownNote) sizeNote += ` | ${drawdownNote}`;
+if (sessionFilterApplied && sessionSizePenalty < 1) sizeNote += ` | ⚠️ Contro-sessione → Size ×${sessionSizePenalty}`;
 sizeNote += ` | Effettiva: ${(sizeMultiplier * 100).toFixed(0)}%`;
 
 // ─── LEVERAGE TABLE (G1: max 20x) ───────────────────────────
@@ -509,6 +536,9 @@ return [{
     sessionLabel,
     hasMemory,
     timestamp: new Date().toISOString(),
+    throttled, // true se segnale duplicato (stesso dir < 30min)
+    lastSignalTs:  throttled ? lastSignalTs  : Date.now(),
+    lastSignalDir: throttled ? lastSignalDir : direction,
 
     _meta: {
       ...(fusion._meta || {}),
