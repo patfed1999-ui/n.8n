@@ -1,0 +1,203 @@
+{
+  "nodes": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440001",
+      "name": "🕚 Tokyo Open — 23:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [200, 200],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 23,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440002",
+      "name": "🕗 Londra Open — 08:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [200, 400],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 8,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440003",
+      "name": "🕐 New York Open — 13:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [200, 600],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 13,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440004",
+      "name": "⚙️ Init Sessione",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 400],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ============================================================\n// INIT SESSIONE — Layer 1\n// Determina la sessione attiva e applica tutti i veti\n// ============================================================\n\n// --- 1. Determina la sessione dal nodo trigger ---\nlet session = null;\n\n// Tentativo 1: campo 'session' già presente nell'input\nconst inputItems = $input.all();\nif (inputItems.length > 0 && inputItems[0].json.session) {\n  session = inputItems[0].json.session;\n}\n\n// Tentativo 2: nome del nodo precedente\nif (!session) {\n  const prevName = $prevNode.name.toUpperCase();\n  if (prevName.includes('TOKYO')) {\n    session = 'TOKYO';\n  } else if (prevName.includes('LONDRA')) {\n    session = 'LONDRA';\n  } else if (prevName.includes('NEW YORK') || prevName.includes('NEW_YORK')) {\n    session = 'NEW_YORK';\n  }\n}\n\n// Tentativo 3: fallback sull'ora UTC corrente\nif (!session) {\n  const nowFb = new Date();\n  const hFb = nowFb.getUTCHours();\n  if (hFb === 23 || hFb === 0) {\n    session = 'TOKYO';\n  } else if (hFb >= 8 && hFb < 10) {\n    session = 'LONDRA';\n  } else if (hFb >= 13 && hFb < 15) {\n    session = 'NEW_YORK';\n  }\n}\n\nif (!session) {\n  return [{ json: { proceed: false, vetoReason: 'UNKNOWN_SESSION' } }];\n}\n\n// --- 2. Ora e giorno correnti UTC ---\nconst now = new Date();\nconst dayOfWeek          = now.getUTCDay();     // 0 = Domenica, 6 = Sabato\nconst currentHour        = now.getUTCHours();\nconst currentMinute      = now.getUTCMinutes();\nconst currentTimeMinutes = currentHour * 60 + currentMinute;\n\n// --- 3. VETO WEEKEND ---\nif (dayOfWeek === 0 || dayOfWeek === 6) {\n  return [{ json: { proceed: false, vetoReason: 'WEEKEND', session } }];\n}\n\n// --- 4. Configurazione sessioni ---\nconst sessionConfig = {\n  TOKYO: {\n    sessionStart:    '23:00',\n    sessionEnd:      '01:00',\n    openBlockStart:  23 * 60,        // 23:00 = 1380 min\n    openBlockEnd:    23 * 60 + 10,   // 23:10 = 1390 min\n    closeBlockStart: 0  * 60 + 50,   // 00:50 = 50 min\n    closeBlockEnd:   1  * 60,        // 01:00 = 60 min\n    maxSignals:      1,\n    minScore:        72,\n    windowMinutes:   120\n  },\n  LONDRA: {\n    sessionStart:    '08:00',\n    sessionEnd:      '10:00',\n    openBlockStart:  8  * 60,        // 08:00 = 480 min\n    openBlockEnd:    8  * 60 + 10,   // 08:10 = 490 min\n    closeBlockStart: 9  * 60 + 50,   // 09:50 = 590 min\n    closeBlockEnd:   10 * 60,        // 10:00 = 600 min\n    maxSignals:      2,\n    minScore:        68,\n    windowMinutes:   120\n  },\n  NEW_YORK: {\n    sessionStart:    '13:00',\n    sessionEnd:      '15:00',\n    openBlockStart:  13 * 60,        // 13:00 = 780 min\n    openBlockEnd:    13 * 60 + 10,   // 13:10 = 790 min\n    closeBlockStart: 14 * 60 + 50,   // 14:50 = 890 min\n    closeBlockEnd:   15 * 60,        // 15:00 = 900 min\n    maxSignals:      2,\n    minScore:        68,\n    windowMinutes:   120\n  }\n};\n\nconst cfg = sessionConfig[session];\n\n// --- 5. VETO APERTURA / CHIUSURA (primi e ultimi 10 minuti) ---\nlet isOpeningVeto = false;\nlet isClosingVeto = false;\n\nif (session === 'TOKYO') {\n  // TOKYO attraversa mezzanotte:\n  //   Apertura:  23:00–23:10  → minuti 1380–1389\n  //   Chiusura:  00:50–01:00  → minuti 50–59\n  isOpeningVeto = (currentTimeMinutes >= cfg.openBlockStart  && currentTimeMinutes < cfg.openBlockEnd);\n  isClosingVeto = (currentTimeMinutes >= cfg.closeBlockStart && currentTimeMinutes < cfg.closeBlockEnd);\n} else {\n  // LONDRA e NEW_YORK: sessione intera nello stesso giorno\n  isOpeningVeto = (currentTimeMinutes >= cfg.openBlockStart  && currentTimeMinutes < cfg.openBlockEnd);\n  isClosingVeto = (currentTimeMinutes >= cfg.closeBlockStart && currentTimeMinutes < cfg.closeBlockEnd);\n}\n\nif (isOpeningVeto) {\n  return [{ json: { proceed: false, vetoReason: 'OPENING_WINDOW', session } }];\n}\nif (isClosingVeto) {\n  return [{ json: { proceed: false, vetoReason: 'CLOSING_WINDOW', session } }];\n}\n\n// --- 6. Tutti i controlli superati: sessione attiva ---\nreturn [{\n  json: {\n    proceed:       true,\n    session:       session,\n    sessionStart:  cfg.sessionStart,\n    sessionEnd:    cfg.sessionEnd,\n    maxSignals:    cfg.maxSignals,\n    minScore:      cfg.minScore,\n    windowMinutes: cfg.windowMinutes,\n    vetoReason:    null\n  }\n}];"
+      }
+    },
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440005",
+      "name": "🔀 Gate — Sessione Attiva?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [800, 400],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-0001-0000-0000-000000000001",
+              "leftValue": "={{ $json.proceed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440006",
+      "name": "📋 Contesto Sessione",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1100, 400],
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "asgn-0001-0000-0000-000000000001",
+              "name": "sessionName",
+              "value": "={{ $json.session }}",
+              "type": "string"
+            },
+            {
+              "id": "asgn-0001-0000-0000-000000000002",
+              "name": "maxSignals",
+              "value": "={{ $json.maxSignals }}",
+              "type": "number"
+            },
+            {
+              "id": "asgn-0001-0000-0000-000000000003",
+              "name": "minScore",
+              "value": "={{ $json.minScore }}",
+              "type": "number"
+            },
+            {
+              "id": "asgn-0001-0000-0000-000000000004",
+              "name": "runTimestamp",
+              "value": "={{ $now.toISO() }}",
+              "type": "string"
+            },
+            {
+              "id": "asgn-0001-0000-0000-000000000005",
+              "name": "weekday",
+              "value": "={{ $now.format('dddd') }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "🕚 Tokyo Open — 23:00 UTC": {
+      "main": [
+        [
+          {
+            "node": "⚙️ Init Sessione",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🕗 Londra Open — 08:00 UTC": {
+      "main": [
+        [
+          {
+            "node": "⚙️ Init Sessione",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🕐 New York Open — 13:00 UTC": {
+      "main": [
+        [
+          {
+            "node": "⚙️ Init Sessione",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "⚙️ Init Sessione": {
+      "main": [
+        [
+          {
+            "node": "🔀 Gate — Sessione Attiva?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔀 Gate — Sessione Attiva?": {
+      "main": [
+        [
+          {
+            "node": "📋 Contesto Sessione",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  }
+}
